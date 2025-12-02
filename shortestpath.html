@@ -1,1 +1,363 @@
+<!doctype html>
+<html lang="ca">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Rutes nàutiques - Algorismes de camí mínim</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <style>
+    body { margin:0; font-family: Inter, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial; }
+    #app { display: grid; grid-template-columns: 360px 1fr; height:100vh; }
+    #sidebar { padding:12px; border-right:1px solid #ddd; overflow:auto; }
+    #map { height:100%; }
+    .btn{display:inline-block;padding:6px 10px;margin:6px 4px;border-radius:6px;border:1px solid #777;background:#f5f5f5;cursor:pointer}
+    .btn.primary{background:#2563eb;color:#fff;border-color:#1e40af}
+    input, select {width:100%;padding:6px;margin:6px 0;border-radius:6px;border:1px solid #bbb}
+    .list {max-height:220px;overflow:auto;border:1px solid #eee;padding:6px;border-radius:6px;background:#fafafa}
+    .node-item{padding:6px;border-bottom:1px solid #eee;display:flex;justify-content:space-between;align-items:center}
+    .small{font-size:12px;color:#555}
+    label{font-weight:600}
+    footer{font-size:12px;color:#666;margin-top:8px}
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div id="sidebar">
+      <h2>Rutes nàutiques — Camí mínim</h2>
+      <p class="small">Clica al mapa per crear un port (node). Connecta automàticament o manual. Tria l'algorisme i calcula la distància mínima.</p>
+
+      <label>Algorisme</label>
+      <select id="algoSelect">
+        <option value="dijkstra">Dijkstra (únic origen)</option>
+        <option value="astar">A* (heurística geogràfica)</option>
+        <option value="floyd">Floyd–Warshall (tots parells)</option>
+      </select>
+
+      <label>Unitat</label>
+      <select id="unitSelect">
+        <option value="km">km</option>
+        <option value="nm">milles nàutiques</option>
+      </select>
+
+      <div style="display:flex;gap:6px;align-items:center">
+        <button class="btn" id="autoConnectBtn">Auto-connecta (radius km)</button>
+        <input id="autoRadius" type="number" value="20" min="1" style="width:84px"/>
+      </div>
+
+      <div style="display:flex;gap:6px;align-items:center">
+        <button class="btn" id="clearBtn">Neteja tot</button>
+        <button class="btn" id="undoBtn">Desfés últim node</button>
+      </div>
+
+      <h3>Ports (nodes)</h3>
+      <div class="list" id="nodesList">Cap port encara. Clica al mapa per afegir.</div>
+
+      <h3>Connexions (arestes)</h3>
+      <div class="small">Selecciona dos ports (checkbox) i prem "Connecta" per crear aresta amb distància geogràfica.</div>
+      <div style="margin-top:6px;display:flex;gap:6px">
+        <button class="btn primary" id="connectBtn">Connecta</button>
+        <button class="btn" id="removeEdgesBtn">Esborra arestes seleccionades</button>
+      </div>
+
+      <h3>Calcula camí</h3>
+      <div style="display:flex;gap:6px;align-items:center">
+        <select id="fromNode"></select>
+        <select id="toNode"></select>
+      </div>
+      <div style="margin-top:8px">
+        <button class="btn primary" id="calcBtn">Calcula</button>
+      </div>
+
+      <div id="output" style="margin-top:10px"></div>
+
+      <footer>
+        <div>Distància calculada amb <strong>distància ortodròmica</strong> (Haversine).</div>
+        <div style="margin-top:6px">1 milla nàutica = 1,852 km</div>
+      </footer>
+    </div>
+
+    <div id="map"></div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    // --- utilitats ---
+    function toRad(deg){return deg*Math.PI/180}
+    function haversineKm(a,b){
+      const R = 6371.0088; // km
+      const dLat = toRad(b.lat-a.lat);
+      const dLon = toRad(b.lng-a.lng);
+      const lat1 = toRad(a.lat), lat2 = toRad(b.lat);
+      const sinLat = Math.sin(dLat/2), sinLon = Math.sin(dLon/2);
+      const c = 2*Math.asin(Math.sqrt(sinLat*sinLat + Math.cos(lat1)*Math.cos(lat2)*sinLon*sinLon));
+      return R*c;
+    }
+    function kmToNm(km){return km/1.852}
+
+    // Graph structures
+    let nodes = []; // {id, lat, lng, marker}
+    let edges = []; // {u,v,dist,polyline}
+
+    const map = L.map('map').setView([41.3851,2.1734], 6);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:18}).addTo(map);
+
+    const nodesListEl = document.getElementById('nodesList');
+    const fromNodeEl = document.getElementById('fromNode');
+    const toNodeEl = document.getElementById('toNode');
+    const outputEl = document.getElementById('output');
+
+    function refreshLists(){
+      // nodes list
+      if(nodes.length===0){ nodesListEl.innerHTML='Cap port encara. Clica al mapa per afegir.'; }
+      else {
+        nodesListEl.innerHTML='';
+        nodes.forEach(n=>{
+          const div = document.createElement('div'); div.className='node-item';
+          div.innerHTML = `<div><strong>${n.id}</strong> <div class=\"small\">${n.lat.toFixed(4)}, ${n.lng.toFixed(4)}</div></div>`;
+          const right = document.createElement('div');
+          const chk = document.createElement('input'); chk.type='checkbox'; chk.dataset.id=n.id; chk.style.marginRight='6px';
+          right.appendChild(chk);
+          const del = document.createElement('button'); del.className='btn'; del.textContent='X'; del.onclick=()=>removeNode(n.id);
+          right.appendChild(del);
+          div.appendChild(right);
+          nodesListEl.appendChild(div);
+        });
+      }
+      // selects
+      fillNodeSelects();
+    }
+
+    function fillNodeSelects(){
+      [fromNodeEl,toNodeEl].forEach(sel=>{
+        sel.innerHTML='';
+        const none = document.createElement('option'); none.value=''; none.textContent='--'; sel.appendChild(none);
+        nodes.forEach(n=>{ const o=document.createElement('option'); o.value=n.id; o.textContent=n.id; sel.appendChild(o); });
+      });
+    }
+
+    function addNode(lat,lng){
+      const id = 'P'+(nodes.length+1);
+      const marker = L.circleMarker([lat,lng],{radius:6,fillColor:'#1f8ef1',color:'#0c66c2'}).addTo(map);
+      marker.bindTooltip(id,{permanent:true,offset:[10,-6]});
+      nodes.push({id,lat,lng,marker});
+      refreshLists();
+    }
+
+    function removeNode(id){
+      // remove node and its marker
+      const i = nodes.findIndex(n=>n.id===id); if(i===-1) return;
+      map.removeLayer(nodes[i].marker);
+      nodes.splice(i,1);
+      // remove edges incident
+      const toRemove = edges.filter(e=>e.u===id||e.v===id);
+      toRemove.forEach(e=>{ if(e.polyline) map.removeLayer(e.polyline); });
+      edges = edges.filter(e=>e.u!==id&&e.v!==id);
+      refreshLists();
+    }
+
+    map.on('click', e=>{ addNode(e.latlng.lat,e.latlng.lng); });
+
+    // edges: connect selected
+    document.getElementById('connectBtn').onclick = ()=>{
+      const checks = Array.from(nodesListEl.querySelectorAll('input[type=checkbox]:checked')).map(c=>c.dataset.id);
+      if(checks.length<2){ alert('Selecciona dos ports per connectar-los.'); return; }
+      // connect pairs sequentially
+      for(let i=0;i+1<checks.length;i++) createEdge(checks[i],checks[i+1]);
+      refreshLists();
+    }
+
+    function createEdge(u,v){
+      if(u===v) return;
+      // check exists
+      if(edges.some(e=> (e.u===u&&e.v===v)||(e.u===v&&e.v===u))) return;
+      const nu = nodes.find(n=>n.id===u), nv = nodes.find(n=>n.id===v);
+      if(!nu||!nv) return;
+      const dist = haversineKm(nu,nv);
+      const polyline = L.polyline([[nu.lat,nu.lng],[nv.lat,nv.lng]],{weight:3}).addTo(map);
+      polyline.bindTooltip(dist.toFixed(2)+' km');
+      edges.push({u,v,dist,polyline});
+    }
+
+    document.getElementById('removeEdgesBtn').onclick = ()=>{
+      const checks = Array.from(nodesListEl.querySelectorAll('input[type=checkbox]:checked')).map(c=>c.dataset.id);
+      if(checks.length<2){ alert('Selecciona almenys dos ports; esborra arestes entre elements seleccionats.'); return; }
+      // remove any edge where both endpoints are in checks (unordered)
+      const toKeep = [];
+      edges.forEach(e=>{
+        const both = checks.includes(e.u) && checks.includes(e.v);
+        if(both){ if(e.polyline) map.removeLayer(e.polyline); }
+        else toKeep.push(e);
+      });
+      edges = toKeep;
+    }
+
+    // Auto connect within radius
+    document.getElementById('autoConnectBtn').onclick = ()=>{
+      const r = parseFloat(document.getElementById('autoRadius').value) || 20;
+      for(let i=0;i<nodes.length;i++) for(let j=i+1;j<nodes.length;j++){
+        const a=nodes[i], b=nodes[j];
+        if(haversineKm(a,b)<=r) createEdge(a.id,b.id);
+      }
+      refreshLists();
+    }
+
+    // Clear/undo
+    document.getElementById('clearBtn').onclick = ()=>{
+      nodes.forEach(n=>map.removeLayer(n.marker)); nodes=[];
+      edges.forEach(e=>{ if(e.polyline) map.removeLayer(e.polyline); }); edges=[];
+      refreshLists(); outputEl.innerHTML='';
+    }
+    document.getElementById('undoBtn').onclick = ()=>{
+      if(nodes.length===0) return;
+      const n = nodes.pop(); map.removeLayer(n.marker);
+      // remove incident edges
+      const toRemove = edges.filter(e=>e.u===n.id||e.v===n.id);
+      toRemove.forEach(e=>{ if(e.polyline) map.removeLayer(e.polyline); });
+      edges = edges.filter(e=>e.u!==n.id&&e.v!==n.id);
+      refreshLists();
+    }
+
+    // --- Algorithms ---
+    function buildAdj(){
+      const g = {};
+      nodes.forEach(n=> g[n.id]=[] );
+      edges.forEach(e=>{ g[e.u].push({to:e.v,w:e.dist}); g[e.v].push({to:e.u,w:e.dist}); });
+      return g;
+    }
+
+    // Dijkstra
+    function dijkstra(source){
+      const g = buildAdj();
+      const dist = {}; const prev = {};
+      nodes.forEach(n=>{ dist[n.id]=Infinity; prev[n.id]=null; });
+      dist[source]=0;
+      const Q = new Set(nodes.map(n=>n.id));
+      while(Q.size){
+        // extract min
+        let u=null; let best=Infinity;
+        Q.forEach(x=>{ if(dist[x]<best){ best=dist[x]; u=x; } });
+        if(u===null || best===Infinity) break;
+        Q.delete(u);
+        g[u].forEach(edge=>{
+          const alt = dist[u]+edge.w;
+          if(alt<dist[edge.to]){ dist[edge.to]=alt; prev[edge.to]=u; }
+        });
+      }
+      return {dist,prev};
+    }
+
+    // A* (using haversine as heuristic in km)
+    function astar(start,goal){
+      const g = buildAdj();
+      const open = new Set([start]);
+      const cameFrom = {};
+      const gscore = {}; const fscore = {};
+      nodes.forEach(n=>{ gscore[n.id]=Infinity; fscore[n.id]=Infinity; });
+      gscore[start]=0; fscore[start]=haversineKm(nodeById(start),nodeById(goal));
+      while(open.size){
+        // find node in open with lowest fscore
+        let current=null; let best=Infinity; open.forEach(x=>{ if(fscore[x]<best){ best=fscore[x]; current=x; } });
+        if(current===goal) break;
+        open.delete(current);
+        g[current].forEach(nei=>{
+          const tentative = gscore[current]+nei.w;
+          if(tentative < gscore[nei.to]){
+            cameFrom[nei.to]=current; gscore[nei.to]=tentative;
+            fscore[nei.to]=tentative + haversineKm(nodeById(nei.to), nodeById(goal));
+            open.add(nei.to);
+          }
+        });
+      }
+      // reconstruct
+      const path=[]; let cur=goal; if(!cameFrom[cur] && cur!==start){ return {path:[], dist:Infinity}; }
+      while(cur){ path.push(cur); if(cur===start) break; cur = cameFrom[cur]; }
+      path.reverse(); return {path, dist: path.length? pathDistance(path) : Infinity};
+    }
+
+    // Floyd–Warshall
+    function floydWarshall(){
+      const idx = {}; nodes.forEach((n,i)=> idx[n.id]=i);
+      const n = nodes.length;
+      const dist = Array.from({length:n},()=>Array(n).fill(Infinity));
+      const next = Array.from({length:n},()=>Array(n).fill(null));
+      for(let i=0;i<n;i++){ dist[i][i]=0; next[i][i]=nodes[i].id; }
+      edges.forEach(e=>{
+        const i=idx[e.u], j=idx[e.v]; dist[i][j]=e.dist; dist[j][i]=e.dist; next[i][j]=e.v; next[j][i]=e.u;
+      });
+      for(let k=0;k<n;k++) for(let i=0;i<n;i++) for(let j=0;j<n;j++){
+        if(dist[i][k]+dist[k][j] < dist[i][j]){ dist[i][j]=dist[i][k]+dist[k][j]; next[i][j]=next[i][k]; }
+      }
+      return {dist, next, idx};
+    }
+
+    // helpers
+    function nodeById(id){ return nodes.find(n=>n.id===id); }
+    function pathDistance(path){ let s=0; for(let i=0;i+1<path.length;i++){ const a=nodeById(path[i]), b=nodeById(path[i+1]); s += haversineKm(a,b); } return s; }
+
+    // run calculation
+    document.getElementById('calcBtn').onclick = ()=>{
+      const algo = document.getElementById('algoSelect').value;
+      const from = fromNodeEl.value; const to = toNodeEl.value;
+      if(!from){ alert('Selecciona port d\'origen.'); return; }
+      if(algo !== 'floyd' && !to){ alert('Selecciona port de destinació.'); return; }
+
+      // clear previous highlighted polylines
+      edges.forEach(e=>{ e.polyline.setStyle({color:'#3388ff', weight:3}); });
+      nodes.forEach(n=> n.marker.setStyle({fillColor:'#1f8ef1'}));
+      outputEl.innerHTML='';
+
+      const unit = document.getElementById('unitSelect').value;
+
+      if(algo==='dijkstra'){
+        const res = dijkstra(from);
+        const distKm = res.dist[to];
+        if(distKm===Infinity){ outputEl.innerHTML='<div class="small">No hi ha camí disponible.</div>'; return; }
+        // reconstruct path
+        const path=[]; let cur=to; while(cur){ path.push(cur); if(cur===from) break; cur=res.prev[cur]; }
+        path.reverse(); highlightPath(path);
+        showResult(path, distKm, unit);
+      } else if(algo==='astar'){
+        const res = astar(from,to);
+        if(res.dist===Infinity){ outputEl.innerHTML='<div class="small">No hi ha camí disponible.</div>'; return; }
+        highlightPath(res.path);
+        showResult(res.path, res.dist, unit);
+      } else if(algo==='floyd'){
+        const fw = floydWarshall();
+        // show matrix and let user pick pair if none selected
+        const n = nodes.length; if(n===0){ outputEl.innerHTML='Cap node.'; return; }
+        let html = '<h4>Matrica de distàncies (km)</h4><div style="overflow:auto;max-height:240px">';
+        html += '<table border=1 cellpadding=4 style="border-collapse:collapse"><tr><th></th>' + nodes.map(n=>`<th>${n.id}</th>`).join('') + '</tr>';
+        for(let i=0;i<n;i++){
+          html += '<tr><th>'+nodes[i].id+'</th>' + fw.dist[i].map(d=>'<td>'+ (d===Infinity? '∞' : d.toFixed(2)) +'</td>').join('') + '</tr>';
+        }
+        html += '</table></div>';
+        outputEl.innerHTML = html;
+      }
+    }
+
+    function highlightPath(path){
+      // highlight the segments by matching edges or drawing new polyline
+      const coords = path.map(id=>{ const n=nodeById(id); return [n.lat,n.lng]; });
+      const pl = L.polyline(coords,{color:'#ff0000',weight:5,opacity:0.85}).addTo(map);
+      // dim edges
+      edges.forEach(e=>{ e.polyline.setStyle({color:'#aaa', weight:2}); });
+      // bounce markers style
+      path.forEach(id=>{ const n=nodeById(id); n.marker.setStyle({fillColor:'#ff5a5a'}); });
+      // remove highlight after 12s
+      setTimeout(()=>{ map.removeLayer(pl); edges.forEach(e=> e.polyline.setStyle({color:'#3388ff', weight:3})); nodes.forEach(n=> n.marker.setStyle({fillColor:'#1f8ef1'})); },12000);
+    }
+
+    function showResult(path, distKm, unit){
+      let display = '';
+      if(path && path.length) display += '<div><strong>Camí:</strong> ' + path.join(' → ') + '</div>';
+      if(unit==='km') display += `<div><strong>Distància mínima:</strong> ${distKm.toFixed(3)} km</div>`;
+      else { const nm = kmToNm(distKm); display += `<div><strong>Distància mínima:</strong> ${nm.toFixed(3)} milles nàutiques</div>`; }
+      outputEl.innerHTML = display;
+    }
+
+    // remove node button handler: delete last created by default
+    refreshLists();
+  </script>
+</body>
+</html>
 
